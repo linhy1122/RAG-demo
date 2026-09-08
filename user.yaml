@@ -1,0 +1,83 @@
+# user.yaml —— Milvus 配置覆盖文件
+# 此文件会覆盖 /milvus/configs/milvus.yaml 中的默认配置
+# 修改后需重启 milvus-standalone 容器生效
+
+# ============ etcd（元数据存储 & 服务发现） ============
+etcd:
+  endpoints: etcd:2379
+  rootPath: by-dev
+  metaSubPath: meta
+  kvSubPath: kv
+  use:
+    embed: false   # 使用独立 etcd 容器；若设为 true 则启用嵌入式 etcd
+
+# ============ MinIO / S3 对象存储 ============
+minio:
+  address: minio:9000
+  port: 9000
+  accessKeyID: minioadmin
+  secretAccessKey: minioadmin
+  useSSL: false
+  bucketName: milvus-bucket
+  rootPath: files
+  cloudProvider: aws
+  region: us-east-1
+  useVirtualHost: false
+  useIAM: false
+  requestTimeoutMs: 10000
+
+# ============ 消息队列（MQ） ============
+# Milvus 3.0 默认使用 Woodpecker（嵌入式，以 MinIO 作为 WAL 后端）
+mq:
+  type: woodpecker
+  enablePursuitMode: true
+  pursuitLag: 10
+
+woodpecker:
+  meta:
+    type: etcd
+    prefix: woodpecker
+  client:
+    segmentAppend:
+      queueSize: 10000
+      maxRetries: 3
+      maxBatchEntries: 1000
+      maxBatchBytes: 2000000
+    segmentRollingPolicy:
+      maxSize: 256M
+      maxInterval: 10m
+      maxBlocks: 1000
+
+# ============ 本地存储（搜索/查询时的向量数据本地缓存） ============
+localStorage:
+  enabled: true
+  path: /var/lib/milvus/data/
+
+# ============ 通用配置 ============
+common:
+  # 存储类型：remote 表示使用 MinIO/S3 等远程对象存储
+  storageType: remote
+  retentionDuration: 43200  # 秒，数据保留时长（默认 12 小时）
+  security:
+    authorizationEnabled: false  # 是否启用授权，生产环境建议开启
+
+# ============ 日志配置 ============
+log:
+  level: info
+  file:
+    rootPath: /var/lib/milvus/logs
+    maxAge: 7  # 天
+
+# ============ 查询节点 ============
+queryNode:
+  gracefulTime: 1000  # ms
+
+# ============ 数据协调 ============
+dataCoord:
+  segment:
+    maxSize: 512  # MB，段文件最大大小
+    sealProportion: 0.75  # 段文件达到 maxSize 的该比例时自动 sealed
+  enableCompaction: true
+  enableGarbageCollection: true
+  gc:
+    dropTolerance: 86400  # 秒
