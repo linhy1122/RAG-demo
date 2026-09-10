@@ -243,3 +243,36 @@ private String sourceOf(Map<String, Object> hit) {
 4. `ChatService.doAsk` 加 retrieval/embed/search 计时；新增 `MAX_QUERY_LOG_LENGTH=200`、`normalizeSource(...)`（`sourceOf` 委托）、`logRetrieval(...)`（rewritten 截断、raw 可配置上限、used source 归一化、used text 二次截断）；两处 exit 统一 `logRetrieval → logTurn → return`
 5. `RagPropertiesTest` 补 `logRetrieval` 与 `logRetrievalMaxRaw` 的默认及显式绑定断言
 6. `mvn test` 全绿；开关 `false` 时 `[chat-retrieval]` 不出现；`score-threshold=1.0`、`log-retrieval-max-raw=0` 边界无异常（验证 3/4/5）
+
+---
+
+## 计划完成情况（实施后记录）
+
+**状态**：✅ 全部实施并验证通过（45 个测试全绿、JaCoCo 覆盖率门槛通过、`mvn verify` BUILD SUCCESS）。下述步骤 0–6 均已按计划完成，并含 3 项计划外调整（均经确认）。
+
+### 实际改动（相对基线 commit `05e4d6b`，共 6 个文件）
+| 文件 | 改动 |
+|---|---|
+| [RagProperties.java](../../rag-xmut/rag/src/main/java/com/wuyunbin/rag/config/RagProperties.java) | `Chat` record 新增 `logRetrieval`（默认 `true`）+ `logRetrievalMaxRaw`（默认 `10`），紧凑构造器兜底同步 |
+| [application.properties](../../rag-xmut/rag/src/main/resources/application.properties) | 追加 `rag.chat.log-retrieval=true`、`rag.chat.log-retrieval-max-raw=10` 及注释（含生产建议 false） |
+| [ChatService.java](../../rag-xmut/rag/src/main/java/com/wuyunbin/rag/service/ChatService.java) | `doAsk` 检索段计时（embed/search/total，`retrievalStart` 包住整个检索阶段）；新增 `MAX_QUERY_LOG_LENGTH=200`、`normalizeSource(...)`（`sourceOf` 委托）、`logRetrieval(...)`；两处 exit 均 `logRetrieval → logTurn → return` |
+| [MilvusRestStore.java](../../rag-xmut/rag/src/main/java/com/wuyunbin/rag/service/MilvusRestStore.java) | `search()` 返回前按相似度（distance/COSINE score）**显式降序排序**（计划外，见下） |
+| [RagPropertiesTest.java](../../rag-xmut/rag/src/test/java/com/wuyunbin/rag/config/RagPropertiesTest.java) | 补 `logRetrieval`/`logRetrievalMaxRaw` 默认值与显式绑定断言 |
+| [ChatServiceTest.java](../../rag-xmut/rag/src/test/java/com/wuyunbin/rag/service/ChatServiceTest.java) | 新增 U16（threshold=1.0）、U17（maxRaw=0）、U18（开关关闭）三个边界测试（计划外，见下） |
+
+### 计划外调整（实施中经确认追加）
+1. **raw 行补正文 `text=`**：首版按评审建议「正文只在 used 打一次」，真实联调时发现 raw 行只有元数据、无具体文本，与「打印被召回的文档内容」的原始需求不符 → 改为 raw 与 used 行均带正文（各按 `chunkMaxChars` 截断），便于对照「召回 vs 实际使用」，重复总量由 `log-retrieval-max-raw` 控制。
+2. **MilvusRestStore 显式降序排序**：按用户要求「相似度按照降序排序」，在 `search()` 返回前显式 `sort(reversed)`，保证 raw[i] 日志、过滤后 sources、回答引用编号 `[1]`=最相似，不依赖 Milvus 默认行为。
+3. **修正计划错误**：`ChatAnswer.SourceItem` 访问器为 `id()`（非计划中写的 `chunkId()`），实现时已改用 `s.id()` 并同步修正本计划 §2c 代码。
+
+### 验证结果
+- `mvn verify`：**45 个测试全绿**（42 基线 + U16/U17/U18），JaCoCo LINE 覆盖率门槛（≥30%）通过，BUILD SUCCESS。
+- 边界场景均无 NPE：
+  - `score-threshold=1.0`：走兜底 A，`usedRefs=0`，摘要/raw 行仍打印、`passedThreshold=false`（U16）；
+  - `log-retrieval-max-raw=0`：raw 全省略只打「raw 省略 N 条」、used 正常（U17）；
+  - `log-retrieval=false`：无任何 `[chat-retrieval]` 行，业务不受影响（U18）。
+- 测试日志可直接看到降序的 `raw[1] score=0.9 → raw[2] score=0.8` 及截断正文。
+
+### 遗留 / 待办
+- **真实联调（可选）**：LM Studio + Milvus 运行时 `mvn spring-boot:run` 后发一次提问，核对 `[chat-retrieval]` 摘要（rawHits/usedRefs/embedCostMs/searchCostMs/retrievalTotalMs）、raw/used 正文、`raw 省略 K 条` 及与回答引用编号一致性。
+- **生产实践**：开发环境默认 `true`；生产部署时通过配置覆盖为 `false`，避免记录敏感正文（身份证/手机号/邮箱/API Key 等）。
