@@ -163,7 +163,7 @@ class ChatServiceTest {
         // historyChars=0、message="问"=1 字符；chunkBudget = contextMax - 0 - systemChars - 1 = 12
         int contextMax = ChatService.SYSTEM_TEMPLATE.length() + 1 + budget;
         RagProperties customProps = new RagProperties(null, null,
-                new RagProperties.Chat(5, 0.45, 20, true, chunkMax, contextMax, 1024));
+                new RagProperties.Chat(5, 0.45, 20, true, chunkMax, contextMax, 1024, true, 10));
         ChatService custom = newService(customProps);
 
         when(milvusRestStore.search(any(float[].class), anyInt())).thenReturn(List.of(
@@ -260,7 +260,7 @@ class ChatServiceTest {
         // historyChars=0、message="问"=1 字符 → chunkBudget=0
         int contextMax = ChatService.SYSTEM_TEMPLATE.length() + 1;
         RagProperties customProps = new RagProperties(null, null,
-                new RagProperties.Chat(5, 0.45, 20, true, 600, contextMax, 1024));
+                new RagProperties.Chat(5, 0.45, 20, true, 600, contextMax, 1024, true, 10));
         ChatService custom = newService(customProps);
         // 检索有结果（≥阈值）
         when(milvusRestStore.search(any(float[].class), anyInt()))
@@ -394,6 +394,81 @@ class ChatServiceTest {
         assertThat(mem.get(1).getMessageType()).isEqualTo(MessageType.ASSISTANT);
         assertThat(mem.get(2).getText()).isEqualTo(secondQuestion);
         assertThat(mem.get(3).getMessageType()).isEqualTo(MessageType.ASSISTANT);
+    }
+
+    // ---------------------------------------------------------------- 召回日志边界
+
+    /** 捕获 ChatService 日志事件（与 U11 同款辅助，避免重复）。 */
+    private List<ILoggingEvent> captureChatServiceLogs(Runnable action) {
+        ch.qos.logback.classic.Logger logger =
+                (ch.qos.logback.classic.Logger) LoggerFactory.getLogger(ChatService.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            action.run();
+        } finally {
+            logger.detachAppender(appender);
+        }
+        return appender.list;
+    }
+
+    @Test
+    @DisplayName("U16 边界：score-threshold=1.0 全部不过阈值 → 兜底A、usedRefs=0、raw 仍打、无 NPE")
+    void U16_thresholdOneAllFiltered() {
+        RagProperties customProps = new RagProperties(null, null,
+                new RagProperties.Chat(5, 1.0, 20, true, 600, 4000, 1024, true, 10));
+        ChatService custom = newService(customProps);
+
+        List<ILoggingEvent> events = captureChatServiceLogs(() -> {
+            ChatAnswer answer = custom.ask("u16", "问题", null);
+            assertThat(answer.reply()).isEqualTo(ChatService.FALLBACK_NO_HIT);
+            assertThat(answer.sources()).isEmpty();
+        });
+
+        assertThat(events)
+                .anyMatch(e -> e.getLevel() == Level.INFO
+                        && e.getFormattedMessage().contains("[chat-retrieval]")
+                        && e.getFormattedMessage().contains("usedRefs=0"))
+                .anyMatch(e -> e.getFormattedMessage().contains("raw[1]")
+                        && e.getFormattedMessage().contains("passedThreshold=false")
+                        && e.getFormattedMessage().contains("text="));
+    }
+
+    @Test
+    @DisplayName("U17 边界：log-retrieval-max-raw=0 → raw 全省略只打省略行、used 正常、无异常")
+    void U17_maxRawZero() {
+        RagProperties customProps = new RagProperties(null, null,
+                new RagProperties.Chat(5, 0.45, 20, true, 600, 4000, 1024, true, 0));
+        ChatService custom = newService(customProps);
+
+        List<ILoggingEvent> events = captureChatServiceLogs(() -> {
+            ChatAnswer answer = custom.ask("u17", "问题", null);
+            assertThat(answer.sources()).hasSize(2);
+        });
+
+        assertThat(events)
+                .anyMatch(e -> e.getFormattedMessage().contains("raw 省略 2 条"))
+                .anyMatch(e -> e.getFormattedMessage().contains("[chat-retrieval]")
+                        && e.getFormattedMessage().contains("used[1]"))
+                .noneMatch(e -> e.getFormattedMessage().contains("raw["));
+    }
+
+    @Test
+    @DisplayName("U18 边界：log-retrieval=false → 不打印任何 [chat-retrieval] 行，业务不受影响")
+    void U18_logRetrievalDisabled() {
+        RagProperties customProps = new RagProperties(null, null,
+                new RagProperties.Chat(5, 0.45, 20, true, 600, 4000, 1024, false, 10));
+        ChatService custom = newService(customProps);
+
+        List<ILoggingEvent> events = captureChatServiceLogs(() -> {
+            ChatAnswer answer = custom.ask("u18", "问题", null);
+            assertThat(answer.reply()).isEqualTo("回答");
+            assertThat(answer.sources()).hasSize(2);
+        });
+
+        assertThat(events)
+                .noneMatch(e -> e.getFormattedMessage().contains("[chat-retrieval]"));
     }
 
     // ---------------------------------------------------------------- 辅助

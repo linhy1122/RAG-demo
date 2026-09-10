@@ -70,6 +70,8 @@ public class ChatService {
     private static final int TOP_K_MAX = 20;
     /** 参与查询改写的历史条数（过滤空白 assistant 后取最近 N 条） */
     private static final int REWRITE_HISTORY_MESSAGES = 4;
+    /** 改写后 Query 日志打印的最大长度（与 chunk 语义无关，独立常量） */
+    private static final int MAX_QUERY_LOG_LENGTH = 200;
     /** 条纹锁数量：ask/history/clear 共用，同会话串行、不同会话并行 */
     private static final int STRIPES = 64;
 
@@ -131,9 +133,16 @@ public class ChatService {
                 ? queryRewriteService.rewrite(message, rewriteHistory)
                 : message;
 
-        // ④ 检索 + 阈值过滤（COSINE，score 越大越相似）
+        // ④ 检索 + 阈值过滤（COSINE，score 越大越相似）；retrievalStart 覆盖整个检索阶段，
+        //    未来在 embed 与 search 之间插入逻辑时 total 计算无需改动
+        long retrievalStart = System.nanoTime();
+        long embedStart = System.nanoTime();
         float[] queryVector = embeddingModel.embed(rewritten);
+        long embedCostMs = (System.nanoTime() - embedStart) / 1_000_000L;
+        long searchStart = System.nanoTime();
         List<Map<String, Object>> hits = milvusRestStore.search(queryVector, topK);
+        long searchCostMs = (System.nanoTime() - searchStart) / 1_000_000L;
+        long retrievalTotalMs = (System.nanoTime() - retrievalStart) / 1_000_000L;
         double threshold = props.chat().scoreThreshold();
         List<Map<String, Object>> filtered = hits.stream()
                 .filter(h -> score(h) >= threshold)
@@ -186,11 +195,15 @@ public class ChatService {
                 sources = refs.sources();
                 fallback = "NONE";
             }
+            logRetrieval(sessionId, rewritten, threshold, hits, sources,
+                    embedCostMs, searchCostMs, retrievalTotalMs);
             logTurn(sessionId, message, rewritten, topK, hits, sources.size(),
                     historyChars, systemChars, chunkBudget, estTokens, fallback);
             return new ChatAnswer(sessionId, reply, sources);
         }
 
+        logRetrieval(sessionId, rewritten, threshold, hits, sources,
+                embedCostMs, searchCostMs, retrievalTotalMs);
         logTurn(sessionId, message, rewritten, topK, hits, 0,
                 historyChars, systemChars, chunkBudget, 0, fallback);
         return new ChatAnswer(sessionId, reply, sources);
@@ -306,9 +319,14 @@ public class ChatService {
         return id instanceof Number n ? n.longValue() : null;
     }
 
+    /** source 归一化：null/blank → "unknown"（raw 与 used 单一口径）。 */
+    private String normalizeSource(String src) {
+        return (src != null && !src.isBlank()) ? src : "unknown";
+    }
+
     private String sourceOf(Map<String, Object> hit) {
         Object s = hit.get("source");
-        return (s instanceof String str && !str.isBlank()) ? str : "unknown";
+        return normalizeSource(s instanceof String str ? str : null);
     }
 
     private String truncate(String text, int maxChars) {
@@ -358,6 +376,55 @@ public class ChatService {
                         + "historyChars={}, systemChars={}, chunkBudget={}, estTokens≈{}, fallback={}",
                 sessionId, raw, rewritten, topK, scores, usedCount,
                 historyChars, systemChars, chunkBudget, estTokens, fallback);
+    }
+
+    /**
+     * 详细召回日志（受 rag.chat.log-retrieval 控制，INFO 级，独立前缀便于 grep）。
+     * 过滤前 topK 每行打 id/score/source/passed 与正文（text 按 chunkMaxChars 截断）；
+     * 过滤后实际入 Prompt 的切片再打一遍（used[..]），便于对照「召回 vs 实际使用」。
+     * rewritten 过长时按 MAX_QUERY_LOG_LENGTH 截断，避免长查询刷屏。
+     */
+    private void logRetrieval(String sessionId, String rewritten, double threshold,
+                              List<Map<String, Object>> hits, List<ChatAnswer.SourceItem> sources,
+                              long embedCostMs, long searchCostMs, long retrievalTotalMs) {
+        if (!props.chat().logRetrieval()) {
+            return;
+        }
+        int chunkMaxChars = props.chat().chunkMaxChars();
+        int maxRaw = props.chat().logRetrievalMaxRaw();
+        log.info("[chat-retrieval] sessionId={}, rewritten={}, threshold={}, rawHits={}, usedRefs={}, "
+                        + "embedCostMs={}, searchCostMs={}, retrievalTotalMs={}",
+                sessionId, truncate(rewritten, MAX_QUERY_LOG_LENGTH), threshold,
+                hits == null ? 0 : hits.size(), sources == null ? 0 : sources.size(),
+                embedCostMs, searchCostMs, retrievalTotalMs);
+
+        if (hits != null && !hits.isEmpty()) {
+            int shown = 0;
+            for (Map<String, Object> h : hits) {
+                if (shown >= maxRaw) {
+                    break;
+                }
+                double score = score(h);
+                log.info("[chat-retrieval] sessionId={}, raw[{}] id={}, score={}, source={}, passedThreshold={}, text={}",
+                        sessionId, shown + 1, idOf(h), score, sourceOf(h), score >= threshold,
+                        truncate(textOf(h), chunkMaxChars));
+                shown++;
+            }
+            if (hits.size() > shown) {
+                log.info("[chat-retrieval] sessionId={}, raw 省略 {} 条",
+                        sessionId, hits.size() - shown);
+            }
+        }
+        if (sources != null) {
+            for (ChatAnswer.SourceItem s : sources) {
+                // 防御式截断：SourceItem.text 已在 buildReferences 里 truncate 过，
+                // 此处仍再 truncate 一次，不依赖其内部实现细节，重复截断无副作用。
+                log.info("[chat-retrieval] sessionId={}, used[{}] id={}, score={}, source={}, text={}",
+                        sessionId, s.index(), s.id(), s.score(),
+                        normalizeSource(s.source()),
+                        truncate(s.text(), chunkMaxChars));
+            }
+        }
     }
 
     private String roleOf(Message m) {

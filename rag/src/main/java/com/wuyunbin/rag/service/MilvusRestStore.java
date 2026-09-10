@@ -5,6 +5,7 @@ import com.wuyunbin.rag.config.RagProperties;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -152,6 +153,10 @@ public class MilvusRestStore {
             row.put("source", item.path("source").asText(null));
             results.add(row);
         }
+        // Milvus 默认按相似度降序返回，这里显式再排一次，防御不同版本/参数下的顺序变化
+        results.sort(Comparator.comparingDouble(
+                        (Map<String, Object> row) -> row.get("distance") instanceof Number n ? n.doubleValue() : 0.0)
+                .reversed());
         return results;
     }
 
