@@ -88,6 +88,12 @@ public class MilvusRestStore {
                 "fieldName", "text",
                 "dataType", "VarChar",
                 "elementTypeParams", Map.of("max_length", "2048")));
+        // 切片来源文件名（仅文件名）；VarChar.max_length 校验 UTF-8 字节，
+        // 上游按 256 字符截断（256×4字节=1024）保证不超限
+        fields.add(Map.of(
+                "fieldName", "source",
+                "dataType", "VarChar",
+                "elementTypeParams", Map.of("max_length", "1024")));
         fields.add(Map.of(
                 "fieldName", vectorFieldName,
                 "dataType", "FloatVector",
@@ -130,7 +136,7 @@ public class MilvusRestStore {
                 "data", List.of(queryVector),
                 "annsField", vectorFieldName,
                 "limit", topK,
-                "outputFields", List.of("text")));
+                "outputFields", List.of("text", "source")));
 
         List<Map<String, Object>> results = new ArrayList<>();
         JsonNode data = resp.get("data");
@@ -143,6 +149,7 @@ public class MilvusRestStore {
             JsonNode id = item.get("id");
             row.put("id", id != null ? id.asLong() : null);
             row.put("text", item.path("text").asText(null));
+            row.put("source", item.path("source").asText(null));
             results.add(row);
         }
         return results;

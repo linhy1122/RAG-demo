@@ -118,6 +118,55 @@
                     </execution>
                 </executions>
             </plugin>
+            <!-- 覆盖率：mvn verify 时 LINE ≥30% 硬卡点（版本由 spring-boot-starter-parent 管理）。
+                 excludes 口径：RagApplication 为纯启动类；MilvusRestStore 的 HTTP 细节由真实联调覆盖，
+                 不进入 JaCoCo 统计（见计划 §8.4）。 -->
+            <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>prepare-agent</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>report</id>
+                        <phase>test</phase>
+                        <goals>
+                            <goal>report</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>check</id>
+                        <phase>verify</phase>
+                        <goals>
+                            <goal>check</goal>
+                        </goals>
+                        <configuration>
+                            <includes>
+                                <include>com/wuyunbin/rag/**</include>
+                            </includes>
+                            <excludes>
+                                <exclude>com/wuyunbin/rag/RagApplication.class</exclude>
+                                <exclude>com/wuyunbin/rag/service/MilvusRestStore.class</exclude>
+                            </excludes>
+                            <rules>
+                                <rule>
+                                    <element>BUNDLE</element>
+                                    <limits>
+                                        <limit>
+                                            <counter>LINE</counter>
+                                            <value>COVEREDRATIO</value>
+                                            <minimum>0.30</minimum>
+                                        </limit>
+                                    </limits>
+                                </rule>
+                            </rules>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
         </plugins>
     </build>
 
