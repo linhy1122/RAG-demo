@@ -28,46 +28,97 @@ public class DocumentIngestService {
 
     private final EmbeddingModel embeddingModel;
     private final MilvusRestStore milvusRestStore;
+    private final MarkdownStateMachineParser parser;
     private final RagProperties props;
 
     public DocumentIngestService(EmbeddingModel embeddingModel,
                                  MilvusRestStore milvusRestStore,
+                                 MarkdownStateMachineParser parser,
                                  RagProperties props) {
         this.embeddingModel = embeddingModel;
         this.milvusRestStore = milvusRestStore;
+        this.parser = parser;
         this.props = props;
     }
 
     /**
      * 导入单个文档文件，返回向量化后写入的块数。
+     * 流程：读取 →（可选）状态机清洗/分块 → 全量向量化（成功后）→ Drop 清空旧数据 → 重建集合 → 插入。
      */
     public int ingest(MultipartFile file) throws IOException {
         String source = resolveSource(file.getOriginalFilename());
         DocumentReader reader = new TikaDocumentReader(file.getResource());
         List<Document> rawDocs = reader.read();
 
-        List<String> chunks = semanticSplit(rawDocs);
-        log.info("Document [{}] read={}, chunks={}, source={}", file.getOriginalFilename(), rawDocs.size(), chunks.size(), source);
-
-        int dimension = resolveDimension();
-        milvusRestStore.ensureCollection(dimension);
-
-        int batchSize = props.ingest().batchSize();
-        int total = 0;
-        List<String> batch = new ArrayList<>(batchSize);
-        for (String chunk : chunks) {
-            batch.add(chunk);
-            if (batch.size() == batchSize) {
-                total += embedAndInsert(batch, source);
-                batch.clear();
+        // ① 状态机整块切分：以两个标题之间为一块，TEXT 整块保留（仅超硬性上限兜底切分）
+        List<MarkdownStateMachineParser.Chunk> chunks = new ArrayList<>();
+        boolean clean = props.clean().enabled();
+        for (Document doc : rawDocs) {
+            String text = doc.getText();
+            if (text == null || text.isBlank()) {
+                continue;
+            }
+            if (clean) {
+                chunks.addAll(parser.parse(text));
+            } else {
+                chunks.addAll(parser.bypass(text));
             }
         }
-        if (!batch.isEmpty()) {
-            total += embedAndInsert(batch, source);
+        log.info("Document [{}] read={}, chunks={}, source={}",
+                file.getOriginalFilename(), rawDocs.size(), chunks.size(), source);
+
+        // ② 模拟失败开关：在任何 embed/入库前抛错，旧数据不被清空（测试专用）
+        if (props.test().simulateEmbedFailure()) {
+            throw new IllegalStateException("simulate-embed-failure=true (test only)");
         }
-        // 重新加载 collection，确保新写入的数据可被检索
+
+        int dimension = resolveDimension();
+        // ③ 全量向量化到内存；失败即返回，未清空 Milvus 旧数据
+        List<float[]> allVectors = new ArrayList<>(chunks.size());
+        for (List<MarkdownStateMachineParser.Chunk> batch : partition(chunks, props.ingest().batchSize())) {
+            allVectors.addAll(embeddingModel.embed(
+                    batch.stream().map(MarkdownStateMachineParser.Chunk::text).toList()));
+        }
+
+        // ④ embed 全部成功后，才清空并重建
+        if (props.ingest().clearBeforeIngest()) {
+            milvusRestStore.tryDrop();
+        }
+        milvusRestStore.ensureCollection(dimension);
+
+        // ⑤ 分批插入，统一补 source/title
+        int batchSize = props.ingest().batchSize();
+        int total = 0;
+        for (int i = 0; i < chunks.size(); i += batchSize) {
+            int end = Math.min(i + batchSize, chunks.size());
+            total += insertRows(chunks.subList(i, end), allVectors.subList(i, end), source);
+        }
         milvusRestStore.loadCollection();
         return total;
+    }
+
+    /** 按固定大小切分列表（惰性视图）。 */
+    static <T> List<List<T>> partition(List<T> list, int size) {
+        List<List<T>> parts = new ArrayList<>();
+        for (int i = 0; i < list.size(); i += size) {
+            parts.add(list.subList(i, Math.min(list.size(), i + size)));
+        }
+        return parts;
+    }
+
+    /** 批量向量化后（已内联在 ingest 中），此处负责把 chunk+vector+source+title 组行并入库。 */
+    private int insertRows(List<MarkdownStateMachineParser.Chunk> chunks, List<float[]> vectors, String source) {
+        List<Map<String, Object>> rows = new ArrayList<>(chunks.size());
+        for (int i = 0; i < chunks.size(); i++) {
+            MarkdownStateMachineParser.Chunk c = chunks.get(i);
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("text", c.text());
+            row.put("source", source);
+            row.put("title", c.titleChain());
+            row.put("vector", vectors.get(i));
+            rows.add(row);
+        }
+        return milvusRestStore.insert(rows);
     }
 
     /**
@@ -87,66 +138,6 @@ public class DocumentIngestService {
         return source;
     }
 
-    /** 包可见以便单元测试（语义切片逻辑覆盖）。 */
-    List<String> semanticSplit(List<Document> documents) {
-        List<String> chunks = new ArrayList<>();
-        for (Document document : documents) {
-            String text = document.getText();
-            if (text == null || text.isBlank()) {
-                continue;
-            }
-
-            List<String> sentences = List.of(text
-                    .replaceAll("\\r\\n?", "\\n")
-                    .split("(?<=[。！？.!?])|\\n+"))
-                    .stream()
-                    .map(String::trim)
-                    .filter(sentence -> !sentence.isBlank())
-                    .toList();
-            if (sentences.isEmpty()) {
-                continue;
-            }
-
-            List<float[]> sentenceVectors = embeddingModel.embed(sentences);
-            StringBuilder current = new StringBuilder();
-            for (int i = 0; i < sentences.size(); i++) {
-                String sentence = sentences.get(i);
-                boolean startsNewChunk = current.length() > 0
-                        && (cosineSimilarity(sentenceVectors.get(i - 1), sentenceVectors.get(i)) < 0.72
-                        || current.length() + sentence.length() > 1200);
-                if (startsNewChunk) {
-                    chunks.add(current.toString());
-                    current.setLength(0);
-                }
-                if (current.length() > 0) {
-                    current.append(' ');
-                }
-                current.append(sentence);
-            }
-            if (current.length() > 0) {
-                chunks.add(current.toString());
-            }
-        }
-        return chunks;
-    }
-
-    /** 包可见以便单元测试。 */
-    double cosineSimilarity(float[] left, float[] right) {
-        double dot = 0;
-        double leftNorm = 0;
-        double rightNorm = 0;
-        int dimensions = Math.min(left.length, right.length);
-        for (int i = 0; i < dimensions; i++) {
-            dot += left[i] * right[i];
-            leftNorm += left[i] * left[i];
-            rightNorm += right[i] * right[i];
-        }
-        if (leftNorm == 0 || rightNorm == 0) {
-            return 0;
-        }
-        return dot / (Math.sqrt(leftNorm) * Math.sqrt(rightNorm));
-    }
-
     /**
      * 检索与 query 最相似的 topK 条知识。
      */
@@ -164,19 +155,6 @@ public class DocumentIngestService {
      */
     public List<Map<String, Object>> list(int limit) {
         return milvusRestStore.query(limit);
-    }
-
-    private int embedAndInsert(List<String> texts, String source) {
-        List<float[]> vectors = embeddingModel.embed(texts);
-        List<Map<String, Object>> rows = new ArrayList<>(texts.size());
-        for (int i = 0; i < texts.size(); i++) {
-            Map<String, Object> row = new LinkedHashMap<>();
-            row.put("text", texts.get(i));
-            row.put("source", source);
-            row.put("vector", vectors.get(i));
-            rows.add(row);
-        }
-        return milvusRestStore.insert(rows);
     }
 
     private int resolveDimension() {

@@ -81,7 +81,7 @@ class ChatServiceTest {
                 hit(1L, 0.90, "文本A相关内容", "a.txt"),
                 hit(2L, 0.80, "文本B相关内容", "b.txt")));
 
-        props = new RagProperties(null, null, null);
+        props = new RagProperties(null, null, null, null, null);
         service = newService(props);
     }
 
@@ -163,7 +163,7 @@ class ChatServiceTest {
         // historyChars=0、message="问"=1 字符；chunkBudget = contextMax - 0 - systemChars - 1 = 12
         int contextMax = ChatService.SYSTEM_TEMPLATE.length() + 1 + budget;
         RagProperties customProps = new RagProperties(null, null,
-                new RagProperties.Chat(5, 0.45, 20, true, chunkMax, contextMax, 1024));
+                new RagProperties.Chat(5, 0.45, 20, true, chunkMax, contextMax, 1024, true, 10), null, null);
         ChatService custom = newService(customProps);
 
         when(milvusRestStore.search(any(float[].class), anyInt())).thenReturn(List.of(
@@ -260,7 +260,7 @@ class ChatServiceTest {
         // historyChars=0、message="问"=1 字符 → chunkBudget=0
         int contextMax = ChatService.SYSTEM_TEMPLATE.length() + 1;
         RagProperties customProps = new RagProperties(null, null,
-                new RagProperties.Chat(5, 0.45, 20, true, 600, contextMax, 1024));
+                new RagProperties.Chat(5, 0.45, 20, true, 600, contextMax, 1024, true, 10), null, null);
         ChatService custom = newService(customProps);
         // 检索有结果（≥阈值）
         when(milvusRestStore.search(any(float[].class), anyInt()))

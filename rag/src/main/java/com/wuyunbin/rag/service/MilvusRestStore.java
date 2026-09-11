@@ -5,6 +5,7 @@ import com.wuyunbin.rag.config.RagProperties;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -87,11 +88,18 @@ public class MilvusRestStore {
         fields.add(Map.of(
                 "fieldName", "text",
                 "dataType", "VarChar",
-                "elementTypeParams", Map.of("max_length", "2048")));
+                // 标题区块整块保留，需容纳单个标题块（MarkdownStateMachineParser.TEXT_MAX_BYTES=12000）；
+                // 留余量取 16384，避免 UTF-8 字节临界超限。
+                "elementTypeParams", Map.of("max_length", "16384")));
         // 切片来源文件名（仅文件名）；VarChar.max_length 校验 UTF-8 字节，
         // 上游按 256 字符截断（256×4字节=1024）保证不超限
         fields.add(Map.of(
                 "fieldName", "source",
+                "dataType", "VarChar",
+                "elementTypeParams", Map.of("max_length", "1024")));
+        // 标题链元数据（如 "第1章 > 1.1节"）；按 256 字符粗截保证字节安全。
+        fields.add(Map.of(
+                "fieldName", "title",
                 "dataType", "VarChar",
                 "elementTypeParams", Map.of("max_length", "1024")));
         fields.add(Map.of(
@@ -109,6 +117,16 @@ public class MilvusRestStore {
 
     public void loadCollection() {
         call("/v2/vectordb/collections/load",
+                Map.of("collectionName", collectionName));
+    }
+
+    /**
+     * 幂等删除集合：集合不存在时 drop 视为成功。
+     * <p>不预先 collectionExists() 短路，避免额外的 REST 调用与 TOCTOU 竞态；
+     * 删除后由 ensureCollection() 重建表并重设索引。</p>
+     */
+    public void tryDrop() {
+        call("/v2/vectordb/collections/drop",
                 Map.of("collectionName", collectionName));
     }
 
@@ -136,7 +154,7 @@ public class MilvusRestStore {
                 "data", List.of(queryVector),
                 "annsField", vectorFieldName,
                 "limit", topK,
-                "outputFields", List.of("text", "source")));
+                "outputFields", List.of("text", "source", "title")));
 
         List<Map<String, Object>> results = new ArrayList<>();
         JsonNode data = resp.get("data");
@@ -150,8 +168,13 @@ public class MilvusRestStore {
             row.put("id", id != null ? id.asLong() : null);
             row.put("text", item.path("text").asText(null));
             row.put("source", item.path("source").asText(null));
+            row.put("title", item.path("title").asText(null));
             results.add(row);
         }
+        // Milvus 默认按相似度降序返回，这里显式再排一次，防御不同版本/参数下的顺序变化
+        results.sort(Comparator.comparingDouble(
+                        (Map<String, Object> row) -> row.get("distance") instanceof Number n ? n.doubleValue() : 0.0)
+                .reversed());
         return results;
     }
 
