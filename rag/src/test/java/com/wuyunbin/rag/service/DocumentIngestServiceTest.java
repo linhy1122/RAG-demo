@@ -25,7 +25,7 @@ class DocumentIngestServiceTest {
     private RagProperties props(boolean clearBeforeIngest, boolean cleanEnabled, boolean simulateEmbedFailure) {
         return new RagProperties(
                 new RagProperties.Milvus("http://localhost:19530", "rag_xmut", 4),
-                new RagProperties.Ingest(16, 5, clearBeforeIngest),
+                new RagProperties.Ingest(16, 5, clearBeforeIngest, 0.60),
                 null,
                 new RagProperties.Clean(cleanEnabled, 1500),
                 new RagProperties.Test(simulateEmbedFailure));

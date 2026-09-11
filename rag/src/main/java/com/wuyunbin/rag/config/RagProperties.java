@@ -34,7 +34,8 @@ public record RagProperties(Milvus milvus, Ingest ingest, Chat chat, Clean clean
     }
 
     public record Ingest(int batchSize, int defaultTopK,
-                         @DefaultValue("true") boolean clearBeforeIngest) {
+                         @DefaultValue("false") boolean clearBeforeIngest,
+                         @DefaultValue("0.60") double scoreThreshold) {
     }
 
     /**

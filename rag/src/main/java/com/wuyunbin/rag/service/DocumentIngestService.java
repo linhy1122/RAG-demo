@@ -139,15 +139,25 @@ public class DocumentIngestService {
     }
 
     /**
-     * 检索与 query 最相似的 topK 条知识。
+     * 检索与 query 最相似的 topK 条知识，并按相似度阈值过滤。
      */
     public Map<String, Object> search(String query, int topK) {
         float[] queryVector = embeddingModel.embed(query);
         List<Map<String, Object>> hits = milvusRestStore.search(queryVector, topK);
+        double threshold = props.ingest().scoreThreshold();
+        List<Map<String, Object>> filtered = hits.stream()
+                .filter(h -> distance(h) >= threshold)
+                .toList();
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("query", query);
-        result.put("hits", hits);
+        result.put("hits", filtered);
         return result;
+    }
+
+    /** 取单条命中记录的相似度值（Milvus distance，COSINE 越大越相似）。 */
+    private double distance(Map<String, Object> hit) {
+        Object d = hit.get("distance");
+        return d instanceof Number n ? n.doubleValue() : 0.0;
     }
 
     /**

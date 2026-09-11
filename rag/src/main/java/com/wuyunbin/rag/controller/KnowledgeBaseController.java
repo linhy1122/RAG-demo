@@ -44,7 +44,7 @@ public class KnowledgeBaseController {
     @GetMapping("/search")
     @Operation(summary = "相似度检索", description = "基于向量语义检索知识库中最相似的内容")
     public Map<String, Object> search(@RequestParam String query,
-                                      @RequestParam(defaultValue = "5") int topK) {
+                                      @RequestParam(defaultValue = "-1") int topK) {
         int k = topK <= 0 ? props.ingest().defaultTopK() : topK;
         return ingestService.search(query, k);
     }
